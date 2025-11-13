@@ -1,0 +1,618 @@
+"""
+Maze Runner: Killer Escape (Pygame) - Full prototype with menu + solo AI
+
+Features:
+- Startup menu: Difficulty (Easy/Medium/Hard) and Player Count (1-4)
+- Solo mode (1 player): Killer is an AI that chases and shoots the player
+- 2-4 players: one random killer (human), others runners
+- Easy: full visibility
+- Medium: darkness + moving light radius around each alive player
+- Hard: darkness + light radius + visually-oscillating walls (no trapping; reserved safe paths)
+- Maze: recursive backtracker; BFS for pathfinding
+- Bullets: killer (human or AI) shoots; bullets collide with walls and players
+"""
+
+import pygame, random, math, sys
+from collections import deque
+from heapq import heappush, heappop
+
+# ---------- Config ----------
+SCREEN_W, SCREEN_H = 1024, 768
+FPS = 60
+
+DIFFICULTY_CONFIG = {
+    "Easy":   {"cols": 21, "rows": 15, "tile": 36, "light_radius": None, "moving": False},
+    "Medium": {"cols": 25, "rows": 19, "tile": 30, "light_radius": 150, "moving": False},
+    "Hard":   {"cols": 31, "rows": 23, "tile": 26, "light_radius": 140, "moving": True}
+}
+
+PLAYER_COLORS = [
+    (66, 135, 245),   # blue
+    (245, 66, 66),    # red
+    (66, 245, 150),   # green
+    (255, 200, 66)    # yellow
+]
+
+KILLER_COLOR = (180, 40, 180)
+EXIT_COLOR = (255, 255, 255)
+WALL_COLOR = (40, 40, 40)
+FLOOR_COLOR = (20, 20, 20)
+
+PLAYER_RADIUS = 10
+PLAYER_SPEED = 2.4
+KILLER_AI_SPEED = 2.0
+BULLET_SPEED = 8
+BULLET_RADIUS = 4
+
+OSCILLATE_AMPLITUDE = 8
+OSCILLATE_FREQ = 0.6
+
+AI_REPATH_INTERVAL = 0.6  # seconds between path recalculations
+AI_SHOOT_COOLDOWN = 0.9   # seconds
+
+# ---------- Helpers ----------
+def clamp(v,a,b): return max(a,min(b,v))
+
+# ---------- Maze generation ----------
+def generate_maze(cols, rows):
+    if cols % 2 == 0: cols += 1
+    if rows % 2 == 0: rows += 1
+    grid = [[0 for _ in range(cols)] for _ in range(rows)]
+
+    def carve(cx, cy):
+        dirs = [(2,0),(-2,0),(0,2),(0,-2)]
+        random.shuffle(dirs)
+        grid[cy][cx] = 1
+        for dx, dy in dirs:
+            nx, ny = cx + dx, cy + dy
+            if 0 < nx < cols and 0 < ny < rows and grid[ny][nx] == 0:
+                grid[cy + dy//2][cx + dx//2] = 1
+                carve(nx, ny)
+
+    carve(1,1)
+    return grid
+
+def bfs_path(grid, start, goal):
+    rows = len(grid)
+    cols = len(grid[0])
+    q = deque([(start, [start])])
+    seen = set([start])
+    while q:
+        (cx, cy), path = q.popleft()
+        if (cx, cy) == goal:
+            return path
+        for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
+            nx, ny = cx+dx, cy+dy
+            if 0 <= nx < cols and 0 <= ny < rows and grid[ny][nx] == 1 and (nx,ny) not in seen:
+                seen.add((nx,ny)); q.append(((nx,ny), path + [(nx,ny)]))
+    return None
+
+def line_of_sight(grid, a_cell, b_cell):
+    # simple Bresenham-like integer line check on cells; returns True if no wall between
+    x0,y0 = a_cell; x1,y1 = b_cell
+    dx = abs(x1-x0); dy = abs(y1-y0)
+    x,y = x0,y0
+    sx = 1 if x1 > x0 else -1
+    sy = 1 if y1 > y0 else -1
+    if dx >= dy:
+        err = dx//2
+        while x != x1:
+            if grid[y][x] == 0: return False
+            err -= dy
+            if err < 0:
+                y += sy; err += dx
+            x += sx
+    else:
+        err = dy//2
+        while y != y1:
+            if grid[y][x] == 0: return False
+            err -= dx
+            if err < 0:
+                x += sx; err += dy
+            y += sy
+    return grid[y1][x1] == 1
+
+def random_floor_cell(grid):
+    rows = len(grid); cols = len(grid[0])
+    tries = 0
+    while True:
+        x = random.randrange(1, cols, 2)
+        y = random.randrange(1, rows, 2)
+        if grid[y][x] == 1:
+            return (x,y)
+        tries += 1
+        if tries > 500:
+            # fallback search
+            for yy in range(rows):
+                for xx in range(cols):
+                    if grid[yy][xx] == 1:
+                        return (xx,yy)
+
+def cell_to_pixel(cx, cy, tile, offset_x, offset_y):
+    return offset_x + cx*tile + tile//2, offset_y + cy*tile + tile//2
+
+# ---------- Game objects ----------
+class Player:
+    def __init__(self, pid, gridpos, color):
+        self.id = pid
+        self.gridpos = gridpos
+        self.x = 0; self.y = 0
+        self.color = color
+        self.is_killer = False
+        self.alive = True
+        self.radius = PLAYER_RADIUS
+        self.speed = PLAYER_SPEED
+        self.heading = 0
+
+    def set_pixel(self, px, py):
+        self.x = px; self.y = py
+
+    def update_move(self, dx, dy, walls, tile, offset_x, offset_y):
+        if not self.alive: return
+        nx = self.x + dx * self.speed
+        ny = self.y + dy * self.speed
+        bbox = pygame.Rect(nx - self.radius, ny - self.radius, self.radius*2, self.radius*2)
+        cols = len(walls[0]); rows = len(walls)
+        left = clamp(int((bbox.left - offset_x)//tile) -1, 0, cols-1)
+        right= clamp(int((bbox.right - offset_x)//tile) +1, 0, cols-1)
+        top  = clamp(int((bbox.top - offset_y)//tile) -1, 0, rows-1)
+        bottom=clamp(int((bbox.bottom - offset_y)//tile) +1, 0, rows-1)
+        blocked = False
+        for gy in range(top, bottom+1):
+            for gx in range(left, right+1):
+                if walls[gy][gx] == 0:
+                    wx = offset_x + gx*tile; wy = offset_y + gy*tile
+                    if pygame.Rect(wx,wy,tile,tile).colliderect(bbox):
+                        blocked = True
+        if not blocked:
+            self.x = nx; self.y = ny
+            if dx != 0 or dy != 0:
+                self.heading = math.atan2(dy, dx)
+
+class Bullet:
+    def __init__(self, x, y, vx, vy, owner):
+        self.x=x; self.y=y; self.vx=vx; self.vy=vy; self.owner=owner; self.alive=True
+    def update(self): self.x += self.vx; self.y += self.vy
+
+# ---------- MazeGame ----------
+class MazeGame:
+    def __init__(self, screen, cols, rows, tile, num_players, difficulty):
+        self.screen = screen
+        self.cols = cols; self.rows = rows; self.tile = tile
+        self.num_players = num_players
+        self.difficulty = difficulty
+        self.moving = DIFFICULTY_CONFIG[difficulty]["moving"]
+        self.light_radius = DIFFICULTY_CONFIG[difficulty]["light_radius"]
+        self.offset_x = (SCREEN_W - self.cols * self.tile)//2
+        self.offset_y = (SCREEN_H - self.rows * self.tile)//2
+
+        self.grid = generate_maze(self.cols, self.rows)
+        self.exit = self._choose_exit()
+
+        self.players = []
+        for i in range(self.num_players):
+            spawn = self._choose_spawn_away(self.exit)
+            p = Player(i, spawn, PLAYER_COLORS[i % len(PLAYER_COLORS)])
+            px,py = cell_to_pixel(spawn[0], spawn[1], self.tile, self.offset_x, self.offset_y)
+            p.set_pixel(px,py)
+            self.players.append(p)
+
+        # reserve safe path(s) from every player to exit
+        self.reserved = set()
+        for p in self.players:
+            path = bfs_path(self.grid, p.gridpos, self.exit)
+            if path:
+                for c in path:
+                    self.reserved.add(c)
+
+        # pick oscillating wall cells (visual only)
+        self.osc_cells = []
+        if self.moving:
+            self._pick_oscillating_cells()
+
+        # killer selection
+        if self.num_players == 1:
+            # AI killer: player 0 is runner, killer is AI (virtual)
+            self.killer_is_ai = True
+            self.killer_idx = None
+            # create an AI 'player' not controlled by human, we will track it as 'ai_killer' object
+            spawn = self._choose_spawn_away(self.exit)
+            self.ai_killer = Player(999, spawn, KILLER_COLOR)
+            self.ai_killer.is_killer = True
+            px,py = cell_to_pixel(spawn[0], spawn[1], self.tile, self.offset_x, self.offset_y)
+            self.ai_killer.set_pixel(px,py)
+        else:
+            self.killer_is_ai = False
+            self.killer_idx = random.randrange(self.num_players)
+            for i,p in enumerate(self.players):
+                p.is_killer = (i == self.killer_idx)
+
+        self.bullets = []
+        self.controls = [
+            {"up":pygame.K_w,"down":pygame.K_s,"left":pygame.K_a,"right":pygame.K_d,"shoot":pygame.K_SPACE},
+            {"up":pygame.K_UP,"down":pygame.K_DOWN,"left":pygame.K_LEFT,"right":pygame.K_RIGHT,"shoot":pygame.K_RSHIFT},
+            {"up":pygame.K_i,"down":pygame.K_k,"left":pygame.K_j,"right":pygame.K_l,"shoot":pygame.K_RCTRL},
+            {"up":pygame.K_KP8,"down":pygame.K_KP5,"left":pygame.K_KP4,"right":pygame.K_KP6,"shoot":pygame.K_KP0},
+        ]
+        self.running = True
+        self.clock = pygame.time.Clock()
+        self.elapsed = 0.0
+        self.font = pygame.font.SysFont("Arial", 20)
+
+        # AI timers & path
+        self.ai_path = None
+        self.ai_path_index = 0
+        self.ai_repath_timer = 0.0
+        self.ai_shoot_cooldown = 0.0
+
+    def _choose_exit(self):
+        candidates = []
+        for x in range(self.cols):
+            for y in range(self.rows):
+                if self.grid[y][x] == 1 and (x==1 or x==self.cols-2 or y==1 or y==self.rows-2):
+                    candidates.append((x,y))
+        if not candidates:
+            for x in range(self.cols):
+                for y in range(self.rows):
+                    if self.grid[y][x] == 1: candidates.append((x,y))
+        return random.choice(candidates)
+
+    def _choose_spawn_away(self, exit_cell):
+        attempts = 0
+        while True:
+            attempts += 1
+            x = random.randrange(1, self.cols, 2)
+            y = random.randrange(1, self.rows, 2)
+            if self.grid[y][x] == 1 and (x,y) != exit_cell:
+                path = bfs_path(self.grid, (x,y), exit_cell)
+                if path and len(path) > 6: return (x,y)
+            if attempts > 500:
+                return random_floor_cell(self.grid)
+
+    def _pick_oscillating_cells(self):
+        candidates = []
+        for y in range(self.rows):
+            for x in range(self.cols):
+                if self.grid[y][x] == 0 and (x,y) not in self.reserved:
+                    candidates.append((x,y))
+        random.shuffle(candidates)
+        pick_count = min(len(candidates), (self.cols*self.rows)//12)
+        for i in range(pick_count):
+            gx,gy = candidates[i]; phase = random.random()*2*math.pi
+            dirn = random.choice([(1,0),(0,1)])
+            self.osc_cells.append((gx,gy,phase,dirn))
+
+    def handle_input(self):
+        keys = pygame.key.get_pressed()
+        for idx,p in enumerate(self.players):
+            if not p.alive: continue
+            ctl = self.controls[idx]
+            dx = 0; dy = 0
+            if keys[ctl["up"]]: dy -= 1
+            if keys[ctl["down"]]: dy += 1
+            if keys[ctl["left"]]: dx -= 1
+            if keys[ctl["right"]]: dx += 1
+            if dx != 0 and dy != 0:
+                dx *= 0.7071; dy *= 0.7071
+            p.update_move(dx, dy, self.grid, self.tile, self.offset_x, self.offset_y)
+            if dx != 0 or dy != 0: p.heading = math.atan2(dy, dx)
+
+    def handle_events(self, event):
+        if event.type == pygame.KEYDOWN:
+            for idx,p in enumerate(self.players):
+                if not p.alive: continue
+                if p.is_killer:
+                    ctl = self.controls[idx]
+                    if event.key == ctl["shoot"]:
+                        # shoot in heading direction (or towards nearest runner)
+                        heading = p.heading if (abs(p.heading) > 1e-6) else 0
+                        vx = math.cos(heading)*BULLET_SPEED; vy = math.sin(heading)*BULLET_SPEED
+                        # if not moving, shoot at nearest runner
+                        if abs(vx) < 1e-6 and abs(vy) < 1e-6:
+                            nearest=None; nd=1e9
+                            for other in self.players:
+                                if other.id==p.id or not other.alive: continue
+                                d = (other.x-p.x)**2 + (other.y-p.y)**2
+                                if d<nd: nd=d; nearest=other
+                            if nearest:
+                                ang = math.atan2(nearest.y-p.y, nearest.x-p.x)
+                                vx = math.cos(ang)*BULLET_SPEED; vy = math.sin(ang)*BULLET_SPEED
+                            else:
+                                vx = BULLET_SPEED; vy = 0
+                        b = Bullet(p.x + math.cos(heading)*(p.radius+6), p.y + math.sin(heading)*(p.radius+6), vx, vy, p.id)
+                        self.bullets.append(b)
+
+    def ai_update(self, dt):
+        # If solo mode, control ai_killer; otherwise nothing
+        if not getattr(self, "killer_is_ai", False): return
+        # target: nearest alive runner (player)
+        targets = [p for p in self.players if p.alive]
+        if not targets:
+            return
+        # choose target runner (player 0 normally)
+        target = targets[0]
+        # convert positions to grid cells
+        ai_cell = (int((self.ai_killer.x - self.offset_x)//self.tile), int((self.ai_killer.y - self.offset_y)//self.tile))
+        target_cell = (int((target.x - self.offset_x)//self.tile), int((target.y - self.offset_y)//self.tile))
+
+        # re-path periodically
+        self.ai_repath_timer -= dt
+        if self.ai_repath_timer <= 0.0 or self.ai_path is None:
+            self.ai_repath_timer = AI_REPATH_INTERVAL
+            self.ai_path = bfs_path(self.grid, ai_cell, target_cell)
+            self.ai_path_index = 0
+
+        # move along path if exists
+        if self.ai_path and len(self.ai_path) > 1 and self.ai_path_index < len(self.ai_path):
+            # next cell in path
+            nxt = self.ai_path[min(self.ai_path_index+1, len(self.ai_path)-1)]
+            nx_px, ny_px = cell_to_pixel(nxt[0], nxt[1], self.tile, self.offset_x, self.offset_y)
+            dx = nx_px - self.ai_killer.x; dy = ny_px - self.ai_killer.y
+            dist = math.hypot(dx, dy)
+            if dist < 3:
+                self.ai_path_index += 1
+            else:
+                vx = (dx/dist) * KILLER_AI_SPEED
+                vy = (dy/dist) * KILLER_AI_SPEED
+                # attempt movement with collision check similar to players
+                # temporarily set heading for bullet direction
+                self.ai_killer.heading = math.atan2(vy, vx) if (abs(vx)>1e-6 or abs(vy)>1e-6) else self.ai_killer.heading
+                # perform movement attempt
+                bbox = pygame.Rect(self.ai_killer.x + vx - self.ai_killer.radius, self.ai_killer.y + vy - self.ai_killer.radius, self.ai_killer.radius*2, self.ai_killer.radius*2)
+                left = clamp(int((bbox.left - self.offset_x)//self.tile) -1, 0, self.cols-1)
+                right= clamp(int((bbox.right - self.offset_x)//self.tile) +1, 0, self.cols-1)
+                top  = clamp(int((bbox.top - self.offset_y)//self.tile) -1, 0, self.rows-1)
+                bottom=clamp(int((bbox.bottom - self.offset_y)//self.tile) +1, 0, self.rows-1)
+                blocked=False
+                for gy in range(top, bottom+1):
+                    for gx in range(left, right+1):
+                        if self.grid[gy][gx] == 0:
+                            wx = self.offset_x + gx*self.tile; wy = self.offset_y + gy*self.tile
+                            if pygame.Rect(wx,wy,self.tile,self.tile).colliderect(bbox):
+                                blocked=True
+                if not blocked:
+                    self.ai_killer.x += vx
+                    self.ai_killer.y += vy
+
+        # shooting behavior: if line of sight (cell-based) and cooldown expired, shoot
+        self.ai_shoot_cooldown -= dt
+        ai_cell = (int((self.ai_killer.x - self.offset_x)//self.tile), int((self.ai_killer.y - self.offset_y)//self.tile))
+        target_cell = (int((target.x - self.offset_x)//self.tile), int((target.y - self.offset_y)//self.tile))
+        if self.ai_shoot_cooldown <= 0 and line_of_sight(self.grid, ai_cell, target_cell):
+            ang = math.atan2(target.y - self.ai_killer.y, target.x - self.ai_killer.x)
+            vx = math.cos(ang)*BULLET_SPEED; vy = math.sin(ang)*BULLET_SPEED
+            b = Bullet(self.ai_killer.x + math.cos(ang)*(self.ai_killer.radius+6), self.ai_killer.y + math.sin(ang)*(self.ai_killer.radius+6), vx, vy, -1)
+            self.bullets.append(b)
+            self.ai_shoot_cooldown = AI_SHOOT_COOLDOWN
+
+    def update(self, dt):
+        self.elapsed += dt
+        # bullets update
+        for b in self.bullets:
+            if not b.alive: continue
+            b.update()
+            gx = int((b.x - self.offset_x)//self.tile); gy = int((b.y - self.offset_y)//self.tile)
+            if gx <0 or gx>=self.cols or gy<0 or gy>=self.rows:
+                b.alive=False; continue
+            if self.grid[gy][gx] == 0:
+                b.alive=False; continue
+            # collisions with players
+            for p in self.players:
+                if not p.alive: continue
+                if p.id == b.owner: continue
+                if (p.x - b.x)**2 + (p.y - b.y)**2 <= (p.radius + BULLET_RADIUS)**2:
+                    p.alive = False; b.alive = False; break
+            # collision with AI killer
+            if getattr(self, "killer_is_ai", False) and self.ai_killer.alive and b.owner != -1:
+                if (self.ai_killer.x - b.x)**2 + (self.ai_killer.y - b.y)**2 <= (self.ai_killer.radius + BULLET_RADIUS)**2:
+                    self.ai_killer.alive = False; b.alive = False
+        self.bullets = [b for b in self.bullets if b.alive]
+
+        # ai update (if solo)
+        self.ai_update(dt)
+
+        # check escape: any runner reaches exit cell
+        for p in self.players:
+            if not p.alive: continue
+            cx = int((p.x - self.offset_x)//self.tile); cy = int((p.y - self.offset_y)//self.tile)
+            if (cx,cy) == self.exit:
+                # runner escape -> runners win
+                self.running = False; self.winner = "Runners (Escape)"; return
+
+        # check killer wins
+        killer_alive = False; runner_alive=False
+        if getattr(self, "killer_is_ai", False):
+            killer_alive = self.ai_killer.alive
+            runner_alive = any(p.alive for p in self.players)
+        else:
+            for p in self.players:
+                if p.is_killer and p.alive: killer_alive=True
+                if not p.is_killer and p.alive: runner_alive=True
+        if killer_alive and not runner_alive:
+            self.running = False
+            self.winner = "Killer (All runners eliminated)"
+            return
+
+    def draw(self):
+        self.screen.fill(FLOOR_COLOR)
+        # draw grid
+        for y in range(self.rows):
+            for x in range(self.cols):
+                gx = self.offset_x + x*self.tile
+                gy = self.offset_y + y*self.tile
+                if self.grid[y][x] == 0:
+                    offset_px, offset_py = 0,0
+                    if self.moving:
+                        for oc in self.osc_cells:
+                            if oc[0]==x and oc[1]==y:
+                                phase, dirn = oc[2], oc[3]
+                                t = self.elapsed
+                                dx = math.sin(2*math.pi*(OSCILLATE_FREQ*t) + phase) * OSCILLATE_AMPLITUDE * dirn[0]
+                                dy = math.sin(2*math.pi*(OSCILLATE_FREQ*t) + phase) * OSCILLATE_AMPLITUDE * dirn[1]
+                                offset_px, offset_py = dx, dy
+                                break
+                    rect = pygame.Rect(gx+offset_px, gy+offset_py, self.tile, self.tile)
+                    pygame.draw.rect(self.screen, WALL_COLOR, rect)
+                else:
+                    pygame.draw.rect(self.screen, FLOOR_COLOR, (gx,gy,self.tile,self.tile))
+
+        # exit
+        ex = self.offset_x + self.exit[0]*self.tile
+        ey = self.offset_y + self.exit[1]*self.tile
+        pygame.draw.rect(self.screen, EXIT_COLOR, (ex+4,ey+4,self.tile-8,self.tile-8), 2)
+
+        # draw players
+        for p in self.players:
+            if not p.alive:
+                pygame.draw.circle(self.screen, (80,80,80), (int(p.x), int(p.y)), p.radius)
+            else:
+                col = KILLER_COLOR if p.is_killer else p.color
+                pygame.draw.circle(self.screen, col, (int(p.x), int(p.y)), p.radius)
+
+        # draw ai killer
+        if getattr(self, "killer_is_ai", False):
+            if not self.ai_killer.alive:
+                pygame.draw.circle(self.screen, (80,80,80), (int(self.ai_killer.x), int(self.ai_killer.y)), self.ai_killer.radius)
+            else:
+                pygame.draw.circle(self.screen, KILLER_COLOR, (int(self.ai_killer.x), int(self.ai_killer.y)), self.ai_killer.radius)
+
+        # bullets
+        for b in self.bullets:
+            pygame.draw.circle(self.screen, (240,240,120), (int(b.x), int(b.y)), BULLET_RADIUS)
+
+        # HUD
+        y = 8
+        if getattr(self, "killer_is_ai", False):
+            status = f"AI Killer - {'Alive' if self.ai_killer.alive else 'Dead'}"
+            s = self.font.render(status, True, (220,220,220)); self.screen.blit(s, (8,y)); y+=24
+        for p in self.players:
+            stat = f"P{p.id+1} {'KILLER' if p.is_killer else 'Runner'} - {'Alive' if p.alive else 'Dead'}"
+            s = self.font.render(stat, True, (220,220,220)); self.screen.blit(s, (8,y)); y+=22
+
+        # darkness layer for medium/hard
+        if self.difficulty != "Easy":
+            dark = pygame.Surface((SCREEN_W, SCREEN_H), flags=pygame.SRCALPHA)
+            dark.fill((0,0,0,220))
+            # reveal circles around alive players and AI killer
+            for p in self.players:
+                if not p.alive: continue
+                r = self.light_radius if self.light_radius else 150
+                pygame.draw.circle(dark, (0,0,0,0), (int(p.x), int(p.y)), r)
+            if getattr(self, "killer_is_ai", False) and self.ai_killer.alive:
+                r = self.light_radius if self.light_radius else 150
+                pygame.draw.circle(dark, (0,0,0,0), (int(self.ai_killer.x), int(self.ai_killer.y)), r)
+            self.screen.blit(dark, (0,0))
+
+    def run(self):
+        while self.running:
+            dt = self.clock.tick(FPS)/1000.0
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit(); sys.exit()
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        pygame.quit(); sys.exit()
+                    self.handle_events(event)
+            self.handle_input()
+            self.update(dt)
+            self.draw()
+            pygame.display.flip()
+
+# ---------- Menu & helpers ----------
+def main_menu(screen):
+    clock = pygame.time.Clock()
+    title_font = pygame.font.SysFont("Arial", 36)
+    small = pygame.font.SysFont("Arial", 20)
+
+    num_players = 1
+    difficulties = ["Easy","Medium","Hard"]
+    diff_idx = 1  # default Medium
+
+    while True:
+        screen.fill((12,12,12))
+        title = title_font.render("Maze Runner: Killer Escape", True, (220,220,220))
+        screen.blit(title, (SCREEN_W//2 - title.get_width()//2, 40))
+
+        # Options display
+        opt1 = small.render(f"Difficulty: {difficulties[diff_idx]}", True, (200,200,200))
+        opt2 = small.render(f"Players: {num_players} (1 = Solo with AI)", True, (200,200,200))
+        start = small.render("Press ENTER to Start  |  Left/Right: Players  |  Up/Down: Difficulty", True, (150,150,150))
+        q = small.render("Press ESC to Quit", True, (130,130,130))
+        screen.blit(opt1, (SCREEN_W//2 - opt1.get_width()//2, 160))
+        screen.blit(opt2, (SCREEN_W//2 - opt2.get_width()//2, 200))
+        screen.blit(start, (SCREEN_W//2 - start.get_width()//2, SCREEN_H - 120))
+        screen.blit(q, (SCREEN_W//2 - q.get_width()//2, SCREEN_H - 90))
+
+        # small control hints
+        lines = [
+            "Controls:",
+            "P1: WASD + Space",
+            "P2: Arrows + RShift",
+            "P3: IJKL + RCtrl",
+            "P4: Numpad 8456 + Numpad0"
+        ]
+        y = 270
+        for ln in lines:
+            s = small.render(ln, True, (170,170,170)); screen.blit(s, (80,y)); y += 24
+
+        pygame.display.flip()
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_LEFT:
+                    num_players = clamp(num_players-1, 1, 4)
+                elif event.key == pygame.K_RIGHT:
+                    num_players = clamp(num_players+1, 1, 4)
+                elif event.key == pygame.K_UP:
+                    diff_idx = (diff_idx - 1) % len(difficulties)
+                elif event.key == pygame.K_DOWN:
+                    diff_idx = (diff_idx + 1) % len(difficulties)
+                elif event.key == pygame.K_RETURN:
+                    return num_players, difficulties[diff_idx]
+                elif event.key == pygame.K_ESCAPE:
+                    pygame.quit(); sys.exit()
+        clock.tick(30)
+
+def show_end(screen, text):
+    clock = pygame.time.Clock()
+    f = pygame.font.SysFont("Arial", 30)
+    small = pygame.font.SysFont("Arial", 18)
+    while True:
+        screen.fill((10,10,10))
+        s = f.render("Game Over - " + text, True, (230,230,230))
+        screen.blit(s, (SCREEN_W//2 - s.get_width()//2, SCREEN_H//2 - 40))
+        s2= small.render("Press ENTER to play again, ESC to quit.", True, (180,180,180))
+        screen.blit(s2, (SCREEN_W//2 - s2.get_width()//2, SCREEN_H//2 + 20))
+        pygame.display.flip()
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if e.type == pygame.KEYDOWN:
+                if e.key == pygame.K_RETURN:
+                    return
+                if e.key == pygame.K_ESCAPE:
+                    pygame.quit(); sys.exit()
+        clock.tick(30)
+
+def main():
+    pygame.init()
+    screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
+    pygame.display.set_caption("Maze Runner: Killer Escape")
+    while True:
+        num_players, difficulty = main_menu(screen)
+        cfg = DIFFICULTY_CONFIG[difficulty]
+        cols = cfg["cols"]; rows = cfg["rows"]; tile = cfg["tile"]
+        # ensure fit
+        if cols*tile > SCREEN_W - 40:
+            tile = max(16, (SCREEN_W - 40)//cols)
+        if rows*tile > SCREEN_H - 40:
+            tile = max(16, (SCREEN_H - 40)//rows)
+        DIFFICULTY_CONFIG[difficulty]["tile"] = tile
+
+        game = MazeGame(screen, cols, rows, tile, num_players, difficulty)
+        game.run()
+        show_end(screen, getattr(game, "winner", "Unknown"))
+
+if __name__ == "__main__":
+    main()
